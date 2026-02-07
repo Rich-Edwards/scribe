@@ -4,8 +4,10 @@ Local transcription and speaker diarization with
 [pyannote](https://github.com/pyannote/pyannote-audio) and
 [parakeet-mlx](https://github.com/senstella/parakeet-mlx).
 
-Takes an audio file, transcribes the speech, optionally identifies
-who spoke when, and produces a speaker-attributed transcript.
+Takes an audio or video file, transcribes the speech, optionally
+identifies who spoke when, and produces a speaker-attributed
+transcript. Any format ffmpeg can read (mp4, mp3, m4a, webm, etc.)
+is automatically converted to WAV for processing.
 
 ## Requirements
 
@@ -47,9 +49,11 @@ The model downloads on first run and is cached locally.
 
 ```sh
 scribe meeting.wav
+scribe recording.mp4
+scribe podcast.mp3
 ```
 
-Writes `meeting.txt`:
+Writes `meeting.txt` / `recording.txt` / `podcast.txt`:
 
 ```
 SPEAKER_00: Thank you for joining. Let's start with the agenda.
