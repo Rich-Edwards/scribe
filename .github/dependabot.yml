@@ -7,13 +7,6 @@ updates:
     cooldown:
       default-days: 7
     groups:
-      ml-stack:
-        patterns:
-          - "torch*"
-          - "pyannote*"
-          - "lightning*"
-          - "huggingface*"
-          - "soundfile"
       everything-else:
         update-types:
           - minor

@@ -2,6 +2,7 @@
 
 import json
 import subprocess
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -14,6 +15,7 @@ from scribe import (
     MergedSegment,
     ScribeError,
     TranscriptionSegment,
+    _create_diarizer,
     _find_ffmpeg,
     _find_uvx,
     _prepare_audio,
@@ -21,7 +23,6 @@ from scribe import (
     format_text,
     format_transcript_json,
     format_transcript_text,
-    load_pipeline,
     main,
     merge,
     run_diarization,
@@ -275,28 +276,29 @@ class TestPrepareAudio:
             pass
 
 
-class TestLoadPipeline:
-    """Tests for load_pipeline()."""
+class TestCreateDiarizer:
+    """Tests for _create_diarizer()."""
 
-    def test_missing_hf_token_raises(self, monkeypatch):
-        monkeypatch.delenv("HF_TOKEN", raising=False)
-        with pytest.raises(ScribeError, match="HF_TOKEN"):
-            load_pipeline()
-
-    def test_missing_pyannote_raises(self, monkeypatch):
-        monkeypatch.setenv("HF_TOKEN", "hf_fake")
+    def test_missing_senko_raises(self, monkeypatch):
         import builtins  # noqa: PLC0415
 
         real_import = builtins.__import__
 
-        def block_pyannote(name, *args, **kwargs):
-            if "pyannote" in name or "torch" in name:
+        def block_senko(name, *args, **kwargs):
+            if name == "senko":
                 raise ImportError(name)
             return real_import(name, *args, **kwargs)
 
-        monkeypatch.setattr(builtins, "__import__", block_pyannote)
-        with pytest.raises(ScribeError, match=r"pyannote\.audio is not installed"):
-            load_pipeline()
+        monkeypatch.setattr(builtins, "__import__", block_senko)
+        with pytest.raises(ScribeError, match="senko is not installed"):
+            _create_diarizer()
+
+    def test_init_failure_raises(self, monkeypatch):
+        mock_senko = MagicMock()
+        mock_senko.Diarizer.side_effect = RuntimeError("CoreML init failed")
+        monkeypatch.setitem(sys.modules, "senko", mock_senko)
+        with pytest.raises(ScribeError, match="Failed to initialize diarizer"):
+            _create_diarizer()
 
 
 class TestRunTranscription:
@@ -356,6 +358,16 @@ class TestRunTranscription:
         with pytest.raises(ScribeError, match="invalid JSON"):
             run_transcription(Path("/fake/audio.wav"))
 
+    def test_subprocess_failure_raises(self, monkeypatch):
+        monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/uvx")
+
+        def fail_run(*_args, **_kwargs):
+            raise subprocess.CalledProcessError(1, "parakeet-mlx", stderr="out of memory")
+
+        monkeypatch.setattr("subprocess.run", fail_run)
+        with pytest.raises(ScribeError, match="parakeet-mlx failed"):
+            run_transcription(Path("/fake/audio.wav"))
+
     def test_no_json_output_raises(self, monkeypatch):
         monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/uvx")
         monkeypatch.setattr(
@@ -369,49 +381,50 @@ class TestRunTranscription:
 class TestRunDiarization:
     """Tests for run_diarization()."""
 
-    def test_wraps_pipeline_errors(self):
-        pipeline = MagicMock(side_effect=RuntimeError("boom"))
+    def test_returns_segments(self):
+        diarizer = MagicMock()
+        diarizer.diarize.return_value = {
+            "merged_segments": [
+                {"speaker": "SPEAKER_01", "start": 0.0, "end": 2.5},
+                {"speaker": "SPEAKER_02", "start": 2.5, "end": 5.0},
+            ],
+        }
+        result = run_diarization(diarizer, Path("/fake/audio.wav"))
+        assert len(result) == 2
+        assert result[0] == DiarizationSegment("SPEAKER_01", 0.0, 2.5)
+        assert result[1] == DiarizationSegment("SPEAKER_02", 2.5, 5.0)
+
+    def test_none_result_returns_empty(self):
+        diarizer = MagicMock()
+        diarizer.diarize.return_value = None
+        result = run_diarization(diarizer, Path("/fake/audio.wav"))
+        assert result == []
+
+    def test_empty_segments_returns_empty(self):
+        diarizer = MagicMock()
+        diarizer.diarize.return_value = {"merged_segments": []}
+        result = run_diarization(diarizer, Path("/fake/audio.wav"))
+        assert result == []
+
+    def test_malformed_result_raises(self):
+        diarizer = MagicMock()
+        diarizer.diarize.return_value = {"wrong_key": []}
         with pytest.raises(ScribeError, match="Diarization failed"):
-            run_diarization(pipeline, Path("/fake/audio.wav"))
+            run_diarization(diarizer, Path("/fake/audio.wav"))
+
+    def test_wraps_diarizer_errors(self):
+        diarizer = MagicMock()
+        diarizer.diarize.side_effect = RuntimeError("boom")
+        with pytest.raises(ScribeError, match="Diarization failed"):
+            run_diarization(diarizer, Path("/fake/audio.wav"))
 
 
 class TestMain:
     """Tests for main() CLI entry point."""
 
     def test_file_not_found(self, monkeypatch):
-        monkeypatch.setattr(
-            "sys.argv", ["scribe", "/nonexistent/audio.wav"]
-        )
+        monkeypatch.setattr("sys.argv", ["scribe", "/nonexistent/audio.wav"])
         with pytest.raises(SystemExit, match="audio file not found"):
-            main()
-
-    def test_num_speakers_zero(self, tmp_path, monkeypatch):
-        audio = tmp_path / "test.wav"
-        audio.touch()
-        monkeypatch.setattr(
-            "sys.argv", ["scribe", str(audio), "--num-speakers", "0"]
-        )
-        with pytest.raises(SystemExit, match="--num-speakers must be >= 1"):
-            main()
-
-    def test_min_greater_than_max(self, tmp_path, monkeypatch):
-        audio = tmp_path / "test.wav"
-        audio.touch()
-        monkeypatch.setattr(
-            "sys.argv",
-            ["scribe", str(audio), "--min-speakers", "5", "--max-speakers", "2"],
-        )
-        with pytest.raises(SystemExit, match="--min-speakers must be <= --max-speakers"):
-            main()
-
-    def test_num_with_min_speakers(self, tmp_path, monkeypatch):
-        audio = tmp_path / "test.wav"
-        audio.touch()
-        monkeypatch.setattr(
-            "sys.argv",
-            ["scribe", str(audio), "--num-speakers", "2", "--min-speakers", "1"],
-        )
-        with pytest.raises(SystemExit, match="--num-speakers cannot be combined"):
             main()
 
     def test_diarize_to_file(self, tmp_path, monkeypatch):
@@ -428,9 +441,7 @@ class TestMain:
             "scribe._run_with_diarization",
             lambda *_a, **_kw: "SPEAKER_00: hello\n",
         )
-        monkeypatch.setattr(
-            "sys.argv", ["scribe", str(audio), "-o", str(out)]
-        )
+        monkeypatch.setattr("sys.argv", ["scribe", str(audio), "-o", str(out)])
         main()
         assert out.read_text() == "SPEAKER_00: hello\n"
 
@@ -453,3 +464,42 @@ class TestMain:
         )
         main()
         assert capsys.readouterr().out == "hello world\n"
+
+    def test_default_output_path_json(self, tmp_path, monkeypatch):
+        audio = tmp_path / "meeting.m4a"
+        audio.touch()
+
+        @contextmanager
+        def fake_prepare(path):
+            yield path
+
+        monkeypatch.setattr("scribe._prepare_audio", fake_prepare)
+        monkeypatch.setattr(
+            "scribe._run_with_diarization",
+            lambda *_a, **_kw: '{"speakers": []}\n',
+        )
+        monkeypatch.setattr(
+            "sys.argv",
+            ["scribe", str(audio), "--format", "json"],
+        )
+        main()
+        expected = tmp_path / "meeting.json"
+        assert expected.exists()
+        assert expected.read_text() == '{"speakers": []}\n'
+
+    def test_scribe_error_exits(self, tmp_path, monkeypatch):
+        audio = tmp_path / "meeting.wav"
+        audio.touch()
+
+        @contextmanager
+        def fake_prepare(path):
+            yield path
+
+        monkeypatch.setattr("scribe._prepare_audio", fake_prepare)
+        monkeypatch.setattr(
+            "scribe._run_with_diarization",
+            MagicMock(side_effect=ScribeError("diarization broke")),
+        )
+        monkeypatch.setattr("sys.argv", ["scribe", str(audio)])
+        with pytest.raises(SystemExit, match="diarization broke"):
+            main()

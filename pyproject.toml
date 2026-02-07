@@ -5,16 +5,16 @@ build-backend = "hatchling.build"
 [project]
 name = "scribe"
 version = "0.1.0"
-description = "Local transcription and speaker diarization with pyannote and parakeet"
+description = "Local transcription and speaker diarization with senko and parakeet"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.13"
 dependencies = [
-    "pyannote.audio>=4.0,<5",
-    "torch==2.10.0",
-    "torchaudio==2.10.0",
-    "soundfile>=0.13.1",
+    "senko @ git+https://github.com/narcotic-sh/senko.git@40250276a691489786bd20bbebffa609dbf5acb0",  # 2026-01-02
 ]
+
+[tool.hatch.metadata]
+allow-direct-references = true  # required for senko git dep; remove if senko publishes to PyPI
 
 [project.scripts]
 scribe = "scribe:main"
