@@ -14,17 +14,22 @@ from scribe import (
     DiarizationSegment,
     MergedSegment,
     ScribeError,
+    SpeakerSample,
     TranscriptionSegment,
     _create_diarizer,
     _find_ffmpeg,
     _find_uvx,
     _prepare_audio,
+    _select_speaker_samples,
+    default_output_path,
     format_json,
     format_text,
     format_transcript_json,
     format_transcript_text,
     main,
     merge,
+    prompt_speaker_labels,
+    rename_speakers,
     run_diarization,
     run_transcription,
 )
@@ -123,6 +128,13 @@ class TestFormatText:
     def test_empty(self):
         assert format_text([]) == ""
 
+    def test_meeting_heading(self):
+        segments = [MergedSegment("A", "hello world", 0.0, 2.0)]
+        assert (
+            format_text(segments, title="Sales and CS L10", meeting_date="2026-06-06")
+            == "# Sales and CS L10 - 2026-06-06\n\nA: hello world\n"
+        )
+
 
 class TestFormatJson:
     """Tests for format_json()."""
@@ -155,6 +167,94 @@ class TestFormatJson:
         data = json.loads(format_json(segments))
         assert data["segments"][0]["start"] == 1.235
         assert data["segments"][0]["end"] == 2.988
+
+    def test_metadata_when_titled(self):
+        segments = [MergedSegment("A", "hi", 1.0, 2.0)]
+        data = json.loads(format_json(segments, title="Ops L10", meeting_date="2026-06-06"))
+        assert data["title"] == "Ops L10"
+        assert data["date"] == "2026-06-06"
+
+
+class TestSpeakerLabels:
+    """Tests for speaker naming helpers."""
+
+    def test_rename_speakers(self):
+        segments = [
+            MergedSegment("SPEAKER_00", "hello", 0.0, 1.0),
+            MergedSegment("SPEAKER_01", "world", 1.0, 2.0),
+        ]
+        result = rename_speakers(segments, {"SPEAKER_00": "Rich"})
+        assert result == [
+            MergedSegment("Rich", "hello", 0.0, 1.0),
+            MergedSegment("SPEAKER_01", "world", 1.0, 2.0),
+        ]
+
+    def test_select_speaker_samples_uses_longest_segment_and_caps_duration(self):
+        diarization = [
+            DiarizationSegment("SPEAKER_00", 0.0, 3.0),
+            DiarizationSegment("SPEAKER_00", 10.0, 30.0),
+            DiarizationSegment("SPEAKER_01", 40.0, 44.0),
+        ]
+        assert _select_speaker_samples(diarization, snippet_seconds=8.0) == [
+            SpeakerSample("SPEAKER_00", 10.0, 18.0),
+            SpeakerSample("SPEAKER_01", 40.0, 44.0),
+        ]
+
+    def test_prompt_speaker_labels_waits_before_playback(self, monkeypatch):
+        prompts = []
+        played_samples = []
+        responses = iter(["", "Rich"])
+
+        def fake_input(prompt):
+            prompts.append(prompt)
+            return next(responses)
+
+        def fake_play(_audio_path, sample):
+            played_samples.append(sample)
+
+        monkeypatch.setattr("builtins.input", fake_input)
+        monkeypatch.setattr("scribe._play_audio_sample", fake_play)
+
+        result = prompt_speaker_labels(
+            Path("recordings/meeting.wav"),
+            [DiarizationSegment("SPEAKER_00", 10.0, 20.0)],
+            snippet_seconds=5.0,
+        )
+
+        assert prompts == [
+            "Press Enter when you are ready to identify speakers.",
+            "Name for SPEAKER_00: ",
+        ]
+        assert played_samples == [SpeakerSample("SPEAKER_00", 10.0, 15.0)]
+        assert result == {"SPEAKER_00": "Rich"}
+
+
+class TestDefaultOutputPath:
+    """Tests for default transcript output path selection."""
+
+    def test_untitled_text_uses_input_stem(self):
+        assert default_output_path(
+            Path("recordings/meeting.m4a"),
+            output_format="text",
+            title=None,
+            meeting_date="2026-06-06",
+        ) == Path("recordings/meeting.txt")
+
+    def test_titled_text_uses_markdown_transcript_name(self):
+        assert default_output_path(
+            Path("recordings/recording.m4a"),
+            output_format="text",
+            title="Sales and CS L10",
+            meeting_date="2026-06-06",
+        ) == Path("recordings/Sales-and-CS-L10_2026-06-06_Transcript.md")
+
+    def test_titled_json_uses_json_transcript_name(self):
+        assert default_output_path(
+            Path("recordings/recording.m4a"),
+            output_format="json",
+            title="Sales and CS L10",
+            meeting_date="2026-06-06",
+        ) == Path("recordings/Sales-and-CS-L10_2026-06-06_Transcript.json")
 
 
 class TestFormatTranscriptText:
@@ -486,6 +586,60 @@ class TestMain:
         expected = tmp_path / "meeting.json"
         assert expected.exists()
         assert expected.read_text() == '{"speakers": []}\n'
+
+    def test_titled_default_output_path(self, tmp_path, monkeypatch):
+        audio = tmp_path / "source.m4a"
+        audio.touch()
+
+        @contextmanager
+        def fake_prepare(path):
+            yield path
+
+        monkeypatch.setattr("scribe._prepare_audio", fake_prepare)
+        monkeypatch.setattr(
+            "scribe._run_with_diarization",
+            lambda *_a, **_kw: "# Sales and CS L10 - 2026-06-06\n\nRich: hello\n",
+        )
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "scribe",
+                str(audio),
+                "--title",
+                "Sales and CS L10",
+                "--date",
+                "2026-06-06",
+            ],
+        )
+        main()
+        expected = tmp_path / "Sales-and-CS-L10_2026-06-06_Transcript.md"
+        assert expected.read_text() == "# Sales and CS L10 - 2026-06-06\n\nRich: hello\n"
+
+    def test_label_speakers_args_passed_to_diarization_runner(self, tmp_path, monkeypatch):
+        audio = tmp_path / "meeting.wav"
+        audio.touch()
+        run_mock = MagicMock(return_value="Rich: hello\n")
+
+        @contextmanager
+        def fake_prepare(path):
+            yield path
+
+        monkeypatch.setattr("scribe._prepare_audio", fake_prepare)
+        monkeypatch.setattr("scribe._run_with_diarization", run_mock)
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "scribe",
+                str(audio),
+                "--label-speakers",
+                "--snippet-seconds",
+                "4",
+            ],
+        )
+        main()
+        speaker_labeling = run_mock.call_args.kwargs["speaker_labeling"]
+        assert speaker_labeling.enabled is True
+        assert speaker_labeling.snippet_seconds == 4
 
     def test_scribe_error_exits(self, tmp_path, monkeypatch):
         audio = tmp_path / "meeting.wav"

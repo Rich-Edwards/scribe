@@ -56,7 +56,39 @@ scribe meeting.wav -o -                   # write to stdout
 scribe meeting.wav --format json          # JSON with timestamps
 scribe meeting.wav --format json -o -     # JSON to stdout
 scribe meeting.wav --no-diarize           # transcript without speakers
+scribe meeting.wav --label-speakers       # play samples and rename speakers
 ```
+
+### Meeting titles
+
+Add a meeting title to put a Markdown heading on the first line and use a
+dated transcript filename:
+
+```sh
+scribe recording.m4a --title "Sales and CS L10" --date 2026-06-06
+```
+
+Writes `Sales-and-CS-L10_2026-06-06_Transcript.md`:
+
+```md
+# Sales and CS L10 - 2026-06-06
+
+Rich: Let's start with the scorecard.
+```
+
+If `--date` is omitted, today's date is used.
+
+### Speaker labeling
+
+After diarization, Scribe can play one short sample for each detected speaker
+and prompt for the speaker's name:
+
+```sh
+scribe recording.m4a --label-speakers --title "Sales and CS L10"
+```
+
+Leave a name blank to keep the generated label such as `SPEAKER_00`. Use
+`--snippet-seconds 5` to change the sample length.
 
 ### JSON output
 

@@ -8,3 +8,9 @@ __pycache__/
 dist/
 *.egg-info/
 /*.json
+*.qta
+test-transcript.txt
+*.scribe.log
+*.scribe.txt
+*_Transcript.md
+*_Transcript.json

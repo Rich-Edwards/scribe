@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -10,6 +11,7 @@ import tempfile
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import NamedTuple, Protocol
 
@@ -17,6 +19,7 @@ UNKNOWN_SPEAKER = "UNKNOWN"
 _PARAKEET_VERSION = "parakeet-mlx>=0.4,<1"
 _FUTURE_TIMEOUT_S = 600
 _ERROR_FUTURE_TIMEOUT_S = 30
+_DEFAULT_SNIPPET_SECONDS = 8.0
 
 
 class ScribeError(Exception):
@@ -54,9 +57,36 @@ class MergedSegment(NamedTuple):
     end: float
 
 
+class SpeakerSample(NamedTuple):
+    """A representative audio sample for naming a diarized speaker."""
+
+    speaker: str
+    start: float
+    end: float
+
+
+class MeetingMetadata(NamedTuple):
+    """Optional metadata to add to transcript output."""
+
+    title: str | None
+    meeting_date: str | None
+
+
+class SpeakerLabelingOptions(NamedTuple):
+    """Options for interactive speaker labeling."""
+
+    enabled: bool
+    snippet_seconds: float
+
+
 def _log(message: str) -> None:
     """Print a progress message to stderr."""
     print(message, file=sys.stderr)  # noqa: T201
+
+
+def _today_iso() -> str:
+    """Return today's local date in ISO format."""
+    return datetime.now(tz=UTC).astimezone().date().isoformat()
 
 
 def _find_ffmpeg() -> str:
@@ -230,10 +260,186 @@ def merge(
     return merged
 
 
-def format_text(segments: list[MergedSegment]) -> str:
+def _meeting_heading(title: str | None, meeting_date: str | None) -> str | None:
+    """Return a Markdown heading for a titled meeting transcript."""
+    if title is None:
+        return None
+    normalized_title = title.strip()
+    if not normalized_title:
+        return None
+    display_date = meeting_date or _today_iso()
+    return f"# {normalized_title} - {display_date}"
+
+
+def _with_meeting_heading(
+    body: str,
+    *,
+    title: str | None,
+    meeting_date: str | None,
+) -> str:
+    """Prefix text output with the meeting heading when provided."""
+    heading = _meeting_heading(title, meeting_date)
+    if heading is None:
+        return body
+    return f"{heading}\n\n{body}".rstrip() + "\n"
+
+
+def _title_slug(title: str) -> str:
+    """Return a filesystem-friendly title slug while preserving title case."""
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", title.strip()).strip("-")
+    return slug or "Meeting"
+
+
+def default_output_path(
+    audio_path: Path,
+    *,
+    output_format: str,
+    title: str | None,
+    meeting_date: str | None,
+) -> Path:
+    """Return the default output path for the requested transcript."""
+    if title and title.strip():
+        display_date = meeting_date or _today_iso()
+        ext = ".json" if output_format == "json" else ".md"
+        return audio_path.with_name(f"{_title_slug(title)}_{display_date}_Transcript{ext}")
+    ext = ".json" if output_format == "json" else ".txt"
+    return audio_path.with_suffix(ext)
+
+
+def rename_speakers(
+    segments: list[MergedSegment],
+    speaker_labels: dict[str, str],
+) -> list[MergedSegment]:
+    """Apply user-provided speaker names to merged transcript segments."""
+    return [
+        MergedSegment(
+            speaker_labels.get(seg.speaker, seg.speaker),
+            seg.text,
+            seg.start,
+            seg.end,
+        )
+        for seg in segments
+    ]
+
+
+def _select_speaker_samples(
+    diarization: list[DiarizationSegment],
+    *,
+    snippet_seconds: float,
+) -> list[SpeakerSample]:
+    """Select the longest available segment per speaker for labeling."""
+    best_by_speaker: dict[str, DiarizationSegment] = {}
+    for segment in diarization:
+        if segment.speaker == UNKNOWN_SPEAKER:
+            continue
+        current = best_by_speaker.get(segment.speaker)
+        if current is None or segment.end - segment.start > current.end - current.start:
+            best_by_speaker[segment.speaker] = segment
+
+    samples = []
+    for speaker, segment in sorted(best_by_speaker.items()):
+        duration = max(0.0, min(snippet_seconds, segment.end - segment.start))
+        if duration > 0:
+            samples.append(SpeakerSample(speaker, segment.start, segment.start + duration))
+    return samples
+
+
+def _play_audio_sample(audio_path: Path, sample: SpeakerSample) -> None:
+    """Extract and play a short speaker sample with ffmpeg and afplay."""
+    ffmpeg = _find_ffmpeg()
+    player = shutil.which("afplay")
+    if player is None:
+        msg = "afplay not found; cannot play speaker samples on this system"
+        raise ScribeError(msg)
+
+    fd, tmp_name = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    duration = sample.end - sample.start
+
+    try:
+        subprocess.run(  # noqa: S603
+            [
+                ffmpeg,
+                "-ss",
+                f"{sample.start:.3f}",
+                "-t",
+                f"{duration:.3f}",
+                "-i",
+                str(audio_path),
+                "-vn",
+                "-acodec",
+                "pcm_s16le",
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
+                str(tmp_path),
+                "-y",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        subprocess.run([player, str(tmp_path)], check=True)  # noqa: S603
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.strip() if exc.stderr else str(exc)
+        msg = f"speaker sample playback failed: {stderr}"
+        raise ScribeError(msg) from exc
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def prompt_speaker_labels(
+    audio_path: Path,
+    diarization: list[DiarizationSegment],
+    *,
+    snippet_seconds: float,
+) -> dict[str, str]:
+    """Play one sample per speaker and prompt for replacement names."""
+    labels: dict[str, str] = {}
+    samples = _select_speaker_samples(diarization, snippet_seconds=snippet_seconds)
+    if not samples:
+        return labels
+
+    _log("")
+    _log("Speaker labeling")
+    _log("Leave a name blank to keep the generated speaker label.")
+
+    try:
+        input("Press Enter when you are ready to identify speakers.")
+    except EOFError:
+        _log("No interactive input available; keeping generated speaker labels.")
+        return labels
+
+    for sample in samples:
+        _log(f"Playing {sample.speaker} sample ({sample.start:.1f}s-{sample.end:.1f}s)...")
+        try:
+            _play_audio_sample(audio_path, sample)
+        except ScribeError as exc:
+            _log(f"Warning: {exc}")
+
+        try:
+            label = input(f"Name for {sample.speaker}: ").strip()
+        except EOFError:
+            _log("No interactive input available; keeping generated speaker labels.")
+            return labels
+
+        if label:
+            labels[sample.speaker] = label
+
+    return labels
+
+
+def format_text(
+    segments: list[MergedSegment],
+    *,
+    title: str | None = None,
+    meeting_date: str | None = None,
+) -> str:
     """Format as plain text, merging consecutive same-speaker segments."""
     if not segments:
-        return ""
+        return _with_meeting_heading("", title=title, meeting_date=meeting_date) if title else ""
 
     lines: list[str] = []
     current_speaker: str | None = None
@@ -252,10 +458,16 @@ def format_text(segments: list[MergedSegment]) -> str:
     if current_texts:
         lines.append(f"{current_speaker}: {' '.join(current_texts)}")
 
-    return "\n".join(lines).strip() + "\n"
+    body = "\n".join(lines).strip() + "\n"
+    return _with_meeting_heading(body, title=title, meeting_date=meeting_date)
 
 
-def format_json(segments: list[MergedSegment]) -> str:
+def format_json(
+    segments: list[MergedSegment],
+    *,
+    title: str | None = None,
+    meeting_date: str | None = None,
+) -> str:
     """Format as JSON with timestamps and speaker attribution."""
     speakers = sorted({seg.speaker for seg in segments})
     data = {
@@ -270,17 +482,31 @@ def format_json(segments: list[MergedSegment]) -> str:
             for seg in segments
         ],
     }
+    if title and title.strip():
+        data["title"] = title.strip()
+        data["date"] = meeting_date or _today_iso()
     return json.dumps(data, indent=2) + "\n"
 
 
-def format_transcript_text(segments: list[TranscriptionSegment]) -> str:
+def format_transcript_text(
+    segments: list[TranscriptionSegment],
+    *,
+    title: str | None = None,
+    meeting_date: str | None = None,
+) -> str:
     """Format transcription as plain text without speaker labels."""
     if not segments:
-        return ""
-    return " ".join(seg.text for seg in segments) + "\n"
+        return _with_meeting_heading("", title=title, meeting_date=meeting_date) if title else ""
+    body = " ".join(seg.text for seg in segments) + "\n"
+    return _with_meeting_heading(body, title=title, meeting_date=meeting_date)
 
 
-def format_transcript_json(segments: list[TranscriptionSegment]) -> str:
+def format_transcript_json(
+    segments: list[TranscriptionSegment],
+    *,
+    title: str | None = None,
+    meeting_date: str | None = None,
+) -> str:
     """Format transcription as JSON without speaker attribution."""
     data = {
         "segments": [
@@ -292,6 +518,9 @@ def format_transcript_json(segments: list[TranscriptionSegment]) -> str:
             for seg in segments
         ],
     }
+    if title and title.strip():
+        data["title"] = title.strip()
+        data["date"] = meeting_date or _today_iso()
     return json.dumps(data, indent=2) + "\n"
 
 
@@ -299,6 +528,8 @@ def _run_with_diarization(
     audio_path: Path,
     *,
     output_format: str,
+    metadata: MeetingMetadata,
+    speaker_labeling: SpeakerLabelingOptions,
 ) -> str:
     """Run full pipeline: transcription + diarization in parallel.
 
@@ -338,18 +569,43 @@ def _run_with_diarization(
     if unknown_count:
         _log(f"Warning: {unknown_count} segments could not be attributed to a speaker")
 
-    return format_json(merged) if output_format == "json" else format_text(merged)
+    if speaker_labeling.enabled:
+        labels = prompt_speaker_labels(
+            audio_path,
+            diarization,
+            snippet_seconds=speaker_labeling.snippet_seconds,
+        )
+        merged = rename_speakers(merged, labels)
+
+    return (
+        format_json(merged, title=metadata.title, meeting_date=metadata.meeting_date)
+        if output_format == "json"
+        else format_text(merged, title=metadata.title, meeting_date=metadata.meeting_date)
+    )
 
 
-def _run_transcript_only(audio_path: Path, *, output_format: str) -> str:
+def _run_transcript_only(
+    audio_path: Path,
+    *,
+    output_format: str,
+    metadata: MeetingMetadata,
+) -> str:
     """Run transcription without diarization."""
     _log("Running transcription...")
     transcription = run_transcription(audio_path)
     _log(f"  Transcribed {len(transcription)} segments")
     return (
-        format_transcript_json(transcription)
+        format_transcript_json(
+            transcription,
+            title=metadata.title,
+            meeting_date=metadata.meeting_date,
+        )
         if output_format == "json"
-        else format_transcript_text(transcription)
+        else format_transcript_text(
+            transcription,
+            title=metadata.title,
+            meeting_date=metadata.meeting_date,
+        )
     )
 
 
@@ -376,10 +632,37 @@ def main() -> None:
         action="store_true",
         help="Transcribe only, without speaker diarization",
     )
+    parser.add_argument(
+        "--label-speakers",
+        action="store_true",
+        help="After diarization, play one snippet per speaker and prompt for names",
+    )
+    parser.add_argument(
+        "--snippet-seconds",
+        type=float,
+        default=_DEFAULT_SNIPPET_SECONDS,
+        help="Seconds to play for each speaker-labeling sample (default: 8)",
+    )
+    parser.add_argument(
+        "--title",
+        help="Meeting title for the transcript heading and default output filename",
+    )
+    parser.add_argument(
+        "--date",
+        dest="meeting_date",
+        default=_today_iso(),
+        help="Meeting date to append to titled output files (default: today)",
+    )
     args = parser.parse_args()
 
     if not args.audio.exists():
         sys.exit(f"Error: audio file not found: {args.audio}")
+
+    if args.snippet_seconds <= 0:
+        sys.exit("Error: --snippet-seconds must be greater than 0")
+
+    metadata = MeetingMetadata(args.title, args.meeting_date)
+    speaker_labeling = SpeakerLabelingOptions(args.label_speakers, args.snippet_seconds)
 
     try:
         with _prepare_audio(args.audio) as wav_path:
@@ -387,18 +670,29 @@ def main() -> None:
                 output = _run_transcript_only(
                     wav_path,
                     output_format=args.output_format,
+                    metadata=metadata,
                 )
             else:
                 output = _run_with_diarization(
                     wav_path,
                     output_format=args.output_format,
+                    metadata=metadata,
+                    speaker_labeling=speaker_labeling,
                 )
 
         if args.output == "-":
             sys.stdout.write(output)
         else:
-            ext = ".json" if args.output_format == "json" else ".txt"
-            output_path = Path(args.output) if args.output else args.audio.with_suffix(ext)
+            output_path = (
+                Path(args.output)
+                if args.output
+                else default_output_path(
+                    args.audio,
+                    output_format=args.output_format,
+                    title=args.title,
+                    meeting_date=args.meeting_date,
+                )
+            )
             output_path.write_text(output)
             _log(f"Wrote transcript to {output_path}")
 
