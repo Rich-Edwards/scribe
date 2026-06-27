@@ -19,6 +19,7 @@ Silicon. Models download automatically on first run (no account needed).
 - [uv](https://docs.astral.sh/uv/) (used to run parakeet-mlx)
 - [ffmpeg](https://ffmpeg.org/) (all input is normalized to 16kHz mono WAV):
   `brew install ffmpeg`
+- `OPENAI_API_KEY` for API-backed meeting summaries
 
 ## Install
 
@@ -89,6 +90,76 @@ scribe recording.m4a --label-speakers --title "Sales and CS L10"
 
 Leave a name blank to keep the generated label such as `SPEAKER_00`. Use
 `--snippet-seconds 5` to change the sample length.
+
+### Meeting summaries
+
+Scribe can generate one Markdown summary from a speaker-labeled meeting
+transcript using the OpenAI Responses API. The transcript filename must end in
+`_Transcript.md`; the companion summary is written as `_Summary.md`.
+
+```sh
+export OPENAI_API_KEY="..."
+# Optional; defaults to the model configured in scribe.py.
+export SCRIBE_OPENAI_MODEL="gpt-5.5"
+
+scribe Sales-and-CS-L10_2026-06-06_Transcript.md \
+  --generate-summary \
+  --title "Sales and CS L10" \
+  --date 2026-06-06 \
+  --meeting-type L10
+```
+
+The macOS launcher also loads `/Users/edwards/Documents/Git/scribe/.env`
+automatically when present. Keep API keys there for local use; `.env` is
+ignored by git.
+
+Supported meeting types are `L10`, `Customer`, and `Other`. Summary generation
+uses canonical examples from the fixed Armen OS meetings folder:
+
+```text
+/Users/edwards/Documents/Git/Armen OS/07-meetings/Meeting Transcripts and Summaries
+```
+
+`L10` is the primary workflow. When `--meeting-type L10` is selected, Scribe
+prioritizes the canonical L10 summary and asks the API for the established
+EOS/L10 structure: front matter, executive summary, key issues/discussion,
+decisions, owner-grouped next steps, cascading messages, meeting rating, and
+bottom line when those details are present in the transcript. Output uses
+simple WYSIWYG-safe Markdown, avoiding tables so it can be pasted into the web
+rich-text notes editor.
+
+After review, file the transcript and summary into the matching meeting-type
+subfolder and move source-side leftovers to macOS Trash:
+
+```sh
+scribe recording.m4a \
+  --finalize-meeting \
+  --meeting-type L10 \
+  --transcript Sales-and-CS-L10_2026-06-06_Transcript.md \
+  --summary Sales-and-CS-L10_2026-06-06_Summary.md \
+  --log-file recording.scribe.log
+```
+
+Finalization fails if the fixed meetings folder, selected meeting-type
+subfolder, source recording, transcript, or summary is missing. It also refuses
+to overwrite existing destination files. Files are copied into temporary
+destination files before the final rename; cleanup to Trash happens only after
+both durable artifacts are filed.
+
+### macOS launcher
+
+`scribe_picker.zsh` runs the end-to-end meeting workflow:
+
+1. Choose the source recording.
+2. Enter meeting title, date, and type.
+3. Transcribe with interactive speaker labeling.
+4. Generate the summary and open it in the default Markdown app for review.
+5. Choose `Retry Summary`, `Finalize`, or `Cancel`.
+6. Confirm Strety handoff is complete or intentionally skipped before filing.
+
+If review is cancelled, the source recording, transcript, summary, and log are
+left in place. On successful finalization, only the filed transcript and filed
+summary remain outside Trash.
 
 ### JSON output
 
