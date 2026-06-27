@@ -10,6 +10,7 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.13"
 dependencies = [
+    "openai>=2.0,<3",
     "senko @ git+https://github.com/narcotic-sh/senko.git@40250276a691489786bd20bbebffa609dbf5acb0",  # 2026-01-02
 ]
 

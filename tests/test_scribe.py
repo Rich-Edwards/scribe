@@ -10,28 +10,38 @@ from unittest.mock import MagicMock
 import pytest
 
 from scribe import (
+    CANONICAL_SUMMARY_EXAMPLES,
+    MEETING_TYPES,
     UNKNOWN_SPEAKER,
     DiarizationSegment,
+    FinalizedArtifacts,
+    MeetingSummaryMetadata,
     MergedSegment,
     ScribeError,
     SpeakerSample,
     TranscriptionSegment,
+    _build_summary_prompt,
     _create_diarizer,
     _find_ffmpeg,
     _find_uvx,
     _prepare_audio,
     _select_speaker_samples,
+    _send_to_trash,
     default_output_path,
+    default_summary_path,
+    finalize_meeting_artifacts,
     format_json,
     format_text,
     format_transcript_json,
     format_transcript_text,
+    generate_summary_from_transcript,
     main,
     merge,
     prompt_speaker_labels,
     rename_speakers,
     run_diarization,
     run_transcription,
+    validate_summary_text,
 )
 
 
@@ -519,6 +529,227 @@ class TestRunDiarization:
             run_diarization(diarizer, Path("/fake/audio.wav"))
 
 
+class TestSummaryGeneration:
+    """Tests for API-backed summary helpers."""
+
+    def test_default_summary_path_replaces_transcript_suffix(self):
+        assert default_summary_path(Path("Sales_2026-06-27_Transcript.md")) == Path(
+            "Sales_2026-06-27_Summary.md",
+        )
+
+    def test_default_summary_path_rejects_unknown_transcript_name(self):
+        with pytest.raises(ScribeError, match=r"_Transcript\.md"):
+            default_summary_path(Path("meeting.md"))
+
+    def test_validate_summary_text_rejects_blank(self):
+        with pytest.raises(ScribeError, match="empty summary"):
+            validate_summary_text("  \n")
+
+    def test_validate_summary_text_rejects_code_fence_wrapper(self):
+        with pytest.raises(ScribeError, match="code fence"):
+            validate_summary_text("```markdown\n# Summary\nBody\n```")
+
+    def test_validate_summary_text_requires_heading(self):
+        with pytest.raises(ScribeError, match="heading"):
+            validate_summary_text("Summary\n\nBody")
+
+    def test_validate_summary_text_allows_front_matter_before_heading(self):
+        summary = "---\ntitle: Meeting\n---\n# Meeting Summary\n\nBody"
+        assert validate_summary_text(summary) == f"{summary}\n"
+
+    def test_validate_summary_text_rejects_unclosed_front_matter(self):
+        with pytest.raises(ScribeError, match="front matter"):
+            validate_summary_text("---\ntitle: Meeting\n# Meeting Summary\n")
+
+    def test_generate_summary_missing_api_key_raises(self, tmp_path):
+        transcript = tmp_path / "Meeting_2026-06-27_Transcript.md"
+        transcript.write_text("# Meeting\n\nRich: hello\n")
+
+        with pytest.raises(ScribeError, match="OPENAI_API_KEY"):
+            generate_summary_from_transcript(
+                transcript,
+                metadata=MeetingSummaryMetadata("Meeting", "2026-06-27", "Other"),
+                env={},
+                meetings_root=tmp_path,
+                request_summary=lambda *_a, **_kw: "# Should not run\n",
+            )
+
+    def test_generate_summary_missing_example_raises(self, tmp_path):
+        transcript = tmp_path / "Meeting_2026-06-27_Transcript.md"
+        transcript.write_text("# Meeting\n\nRich: hello\n")
+
+        with pytest.raises(ScribeError, match="canonical example"):
+            generate_summary_from_transcript(
+                transcript,
+                metadata=MeetingSummaryMetadata("Meeting", "2026-06-27", "Other"),
+                env={"OPENAI_API_KEY": "key"},
+                meetings_root=tmp_path,
+                request_summary=lambda *_a, **_kw: "# Should not run\n",
+            )
+
+    def test_generate_summary_writes_valid_summary(self, tmp_path):
+        meetings_root = tmp_path / "meetings"
+        for meeting_type in MEETING_TYPES:
+            (meetings_root / meeting_type).mkdir(parents=True)
+        for meeting_type, relative_path in CANONICAL_SUMMARY_EXAMPLES.items():
+            path = meetings_root / meeting_type / relative_path
+            path.write_text(f"# {meeting_type} Example\n\nUseful notes.\n")
+
+        transcript = tmp_path / "Meeting_2026-06-27_Transcript.md"
+        transcript.write_text("# Meeting\n\nRich: hello\n")
+        calls = []
+
+        def fake_request(*, prompt, api_key, model):
+            calls.append((prompt, api_key, model))
+            return "# Meeting 2026-06-27 Summary\n\n## Executive Summary\n- Useful note.\n"
+
+        summary_path = generate_summary_from_transcript(
+            transcript,
+            metadata=MeetingSummaryMetadata("Meeting", "2026-06-27", "Other"),
+            env={"OPENAI_API_KEY": "key", "SCRIBE_OPENAI_MODEL": "test-model"},
+            meetings_root=meetings_root,
+            request_summary=fake_request,
+        )
+
+        assert summary_path == tmp_path / "Meeting_2026-06-27_Summary.md"
+        assert "Useful note" in summary_path.read_text()
+        assert calls
+        assert calls[0][1:] == ("key", "test-model")
+        assert "Rich: hello" in calls[0][0]
+
+    def test_l10_prompt_uses_l10_specific_contract_and_primary_example(self):
+        prompt = _build_summary_prompt(
+            transcript_text="# Sales L10\n\nRich: Review rocks and IDS issues.",
+            metadata=MeetingSummaryMetadata("Sales L10", "2026-06-27", "L10"),
+            examples={
+                "Customer": "# Customer Example\n\nCustomer format.",
+                "L10": "# L10 Example\n\n## Meeting Rating\n- Rich rated it a 9.",
+                "Other": "# Other Example\n\nOther format.",
+            },
+            revision_note=None,
+            source_name="Sales-L10_2026-06-27_Transcript.md",
+        )
+
+        assert "Primary contract for L10 meetings" in prompt
+        assert "YAML front matter" in prompt
+        assert "WYSIWYG-safe Markdown" in prompt
+        assert "no tables" in prompt
+        assert "Sales-L10_2026-06-27_Transcript.md" in prompt
+        assert "source must equal the exact source transcript filename" in prompt
+        assert "To-Dos / Next Steps" in prompt
+        assert "Cascading Messages" in prompt
+        assert "Meeting Rating" in prompt
+        assert prompt.index("## Primary L10 Example") < prompt.index(
+            "## Supporting Customer Example",
+        )
+
+    def test_generate_summary_preserves_existing_summary_on_invalid_retry(self, tmp_path):
+        meetings_root = tmp_path / "meetings"
+        for meeting_type in MEETING_TYPES:
+            (meetings_root / meeting_type).mkdir(parents=True)
+        for meeting_type, relative_path in CANONICAL_SUMMARY_EXAMPLES.items():
+            (meetings_root / meeting_type / relative_path).write_text("# Example\n\nBody\n")
+
+        transcript = tmp_path / "Meeting_2026-06-27_Transcript.md"
+        transcript.write_text("# Meeting\n\nRich: hello\n")
+        summary = tmp_path / "Meeting_2026-06-27_Summary.md"
+        summary.write_text("# Existing\n\nKeep me.\n")
+
+        with pytest.raises(ScribeError, match="empty summary"):
+            generate_summary_from_transcript(
+                transcript,
+                metadata=MeetingSummaryMetadata("Meeting", "2026-06-27", "Other"),
+                env={"OPENAI_API_KEY": "key"},
+                meetings_root=meetings_root,
+                request_summary=lambda *_a, **_kw: "",
+            )
+
+        assert summary.read_text() == "# Existing\n\nKeep me.\n"
+
+
+class TestFinalizeMeetingArtifacts:
+    """Tests for safe meeting artifact finalization."""
+
+    def test_send_to_trash_uses_alias_for_posix_path(self, tmp_path, monkeypatch):
+        target = tmp_path / "recording.m4a"
+        target.write_text("audio")
+        run_mock = MagicMock()
+        monkeypatch.setattr(subprocess, "run", run_mock)
+
+        _send_to_trash(target)
+
+        assert run_mock.call_args.args[0] == ["/usr/bin/osascript", "-", str(target)]
+        assert "as alias" in run_mock.call_args.kwargs["input"]
+        assert "delete targetFile" in run_mock.call_args.kwargs["input"]
+
+    def test_finalize_stages_files_then_trashes_sources(self, tmp_path):
+        root = tmp_path / "meetings"
+        dest = root / "L10"
+        dest.mkdir(parents=True)
+        recording = tmp_path / "recording.m4a"
+        transcript = tmp_path / "Meeting_2026-06-27_Transcript.md"
+        summary = tmp_path / "Meeting_2026-06-27_Summary.md"
+        log = tmp_path / "recording.scribe.log"
+        for path in (recording, transcript, summary, log):
+            path.write_text(path.name)
+        trashed = []
+
+        result = finalize_meeting_artifacts(
+            recording=recording,
+            transcript=transcript,
+            summary=summary,
+            log_file=log,
+            meeting_type="L10",
+            meetings_root=root,
+            trash_file=trashed.append,
+        )
+
+        assert result.transcript == dest / transcript.name
+        assert result.summary == dest / summary.name
+        assert result.transcript.read_text() == transcript.name
+        assert result.summary.read_text() == summary.name
+        assert trashed == [recording, transcript, summary, log]
+
+    def test_finalize_rejects_destination_collision(self, tmp_path):
+        root = tmp_path / "meetings"
+        dest = root / "Other"
+        dest.mkdir(parents=True)
+        recording = tmp_path / "recording.m4a"
+        transcript = tmp_path / "Meeting_2026-06-27_Transcript.md"
+        summary = tmp_path / "Meeting_2026-06-27_Summary.md"
+        for path in (recording, transcript, summary):
+            path.write_text(path.name)
+        (dest / summary.name).write_text("existing")
+        trashed = []
+
+        with pytest.raises(ScribeError, match="already exists"):
+            finalize_meeting_artifacts(
+                recording=recording,
+                transcript=transcript,
+                summary=summary,
+                log_file=None,
+                meeting_type="Other",
+                meetings_root=root,
+                trash_file=trashed.append,
+            )
+
+        assert trashed == []
+        assert transcript.exists()
+        assert summary.exists()
+
+    def test_finalize_rejects_missing_root(self, tmp_path):
+        with pytest.raises(ScribeError, match="meetings folder not found"):
+            finalize_meeting_artifacts(
+                recording=tmp_path / "recording.m4a",
+                transcript=tmp_path / "Transcript.md",
+                summary=tmp_path / "Summary.md",
+                log_file=None,
+                meeting_type="Other",
+                meetings_root=tmp_path / "missing",
+                trash_file=lambda _path: None,
+            )
+
+
 class TestMain:
     """Tests for main() CLI entry point."""
 
@@ -640,6 +871,77 @@ class TestMain:
         speaker_labeling = run_mock.call_args.kwargs["speaker_labeling"]
         assert speaker_labeling.enabled is True
         assert speaker_labeling.snippet_seconds == 4
+
+    def test_generate_summary_cli(self, tmp_path, monkeypatch):
+        transcript = tmp_path / "Meeting_2026-06-27_Transcript.md"
+        transcript.write_text("# Meeting\n\nRich: hello\n")
+        run_mock = MagicMock(return_value=tmp_path / "Meeting_2026-06-27_Summary.md")
+        monkeypatch.setattr("scribe.generate_summary_from_transcript", run_mock)
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "scribe",
+                str(transcript),
+                "--generate-summary",
+                "--title",
+                "Meeting",
+                "--date",
+                "2026-06-27",
+                "--meeting-type",
+                "Other",
+                "--revision-note",
+                "shorter",
+            ],
+        )
+
+        main()
+
+        assert run_mock.call_args.args == (transcript,)
+        assert run_mock.call_args.kwargs["metadata"] == MeetingSummaryMetadata(
+            "Meeting",
+            "2026-06-27",
+            "Other",
+        )
+        assert run_mock.call_args.kwargs["revision_note"] == "shorter"
+
+    def test_finalize_meeting_cli(self, tmp_path, monkeypatch):
+        recording = tmp_path / "recording.m4a"
+        transcript = tmp_path / "Meeting_2026-06-27_Transcript.md"
+        summary = tmp_path / "Meeting_2026-06-27_Summary.md"
+        log = tmp_path / "recording.scribe.log"
+        for path in (recording, transcript, summary, log):
+            path.write_text(path.name)
+        run_mock = MagicMock(
+            return_value=FinalizedArtifacts(
+                tmp_path / "filed_transcript.md",
+                tmp_path / "filed_summary.md",
+            ),
+        )
+        monkeypatch.setattr("scribe.finalize_meeting_artifacts", run_mock)
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "scribe",
+                str(recording),
+                "--finalize-meeting",
+                "--meeting-type",
+                "L10",
+                "--transcript",
+                str(transcript),
+                "--summary",
+                str(summary),
+                "--log-file",
+                str(log),
+            ],
+        )
+
+        main()
+
+        assert run_mock.call_args.kwargs["recording"] == recording
+        assert run_mock.call_args.kwargs["transcript"] == transcript
+        assert run_mock.call_args.kwargs["summary"] == summary
+        assert run_mock.call_args.kwargs["log_file"] == log
+        assert run_mock.call_args.kwargs["meeting_type"] == "L10"
 
     def test_scribe_error_exits(self, tmp_path, monkeypatch):
         audio = tmp_path / "meeting.wav"
